@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.vscode/
+
+data/processed/final_risk_data.csv
+data/processed/master_risk_scored.csv
+data/data/processed/master_risk_scored.csv
