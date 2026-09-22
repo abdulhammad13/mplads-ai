@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+from datetime import date, datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Final
 
-import numpy as np
-import pandas as pd
+import polars as pl
 
 from .data_loader import load_data
 
@@ -15,219 +15,1001 @@ from .data_loader import load_data
 # PROJECT CONFIGURATION
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 
-MASTER_PATH = PROCESSED_DIR / "master_works.csv"
-EXPENDITURE_PATH = PROCESSED_DIR / "expenditure_summary.csv"
+PROCESSED_DIR: Final[Path] = (
+    PROJECT_ROOT / "data" / "processed"
+)
 
-PIPELINE_VERSION = "4.0"
+MASTER_PATH: Final[Path] = (
+    PROCESSED_DIR / "master_works.csv"
+)
 
-# Reproducible monitoring snapshot:
-# set MPLADS_AS_OF_DATE=YYYY-MM-DD for a fixed batch.
-DEFAULT_AS_OF_DATE = pd.Timestamp.today().normalize()
+EXPENDITURE_PATH: Final[Path] = (
+    PROCESSED_DIR / "expenditure_summary.csv"
+)
+
+
+# ------------------------------------------------------------
+# Pipeline version
+# ------------------------------------------------------------
+#
+# 4.0 was the previous Pandas implementation.
+# 5.0 represents the Polars-native implementation while
+# preserving the analytical methodology and output fields.
+#
+
+PIPELINE_VERSION: Final[str] = "5.0"
 
 
 # ============================================================
-# GENERIC TYPE-SAFE HELPERS
+# ANALYTICAL CONFIGURATION
 # ============================================================
 
-def numeric(series: pd.Series | None) -> pd.Series:
+GENERAL_ONE_YEAR_BENCHMARK_DAYS: Final[int] = 365
+
+MIN_DUPLICATE_TEXT_LENGTH: Final[int] = 8
+
+
+# ============================================================
+# SOURCE COLUMN DEFINITIONS
+# ============================================================
+
+FINANCIAL_COLUMNS: Final[tuple[str, ...]] = (
+    "sanction_amount",
+    "recommended_amount",
+    "completed_amount",
+    "allocated_amount",
+    "total_expenditure",
+)
+
+
+DATE_COLUMNS: Final[tuple[str, ...]] = (
+    "recommended_date",
+    "sanction_date",
+    "completion_date",
+    "expenditure_date",
+)
+
+
+TEXT_COLUMNS: Final[tuple[str, ...]] = (
+    "state",
+    "district",
+    "mp",
+    "constituency",
+    "ida",
+    "work",
+    "work_description",
+    "work_category",
+    "work_status",
+    "vendor_name",
+    "payment_status",
+)
+
+
+# ============================================================
+# DATE PARSING
+# ============================================================
+
+DATE_FORMATS: Final[tuple[str, ...]] = (
+    # Date only
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+    "%d.%m.%Y",
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+
+    # Date + time
+    "%d/%m/%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M:%S",
+    "%d.%m.%Y %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S",
+    "%m/%d/%Y %H:%M:%S",
+
+    # Fractional seconds
+    "%d/%m/%Y %H:%M:%S%.f",
+    "%d-%m-%Y %H:%M:%S%.f",
+    "%d.%m.%Y %H:%M:%S%.f",
+    "%Y-%m-%d %H:%M:%S%.f",
+    "%m/%d/%Y %H:%M:%S%.f",
+
+    # Month names
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    "%d-%b-%Y %H:%M:%S",
+    "%d-%B-%Y %H:%M:%S",
+)
+
+
+# ============================================================
+# GENERIC POLARS HELPERS
+# ============================================================
+
+def numeric_expr(column: str) -> pl.Expr:
     """
-    Convert arbitrary input to float64 safely.
+    Convert an arbitrary source column into Float64.
 
-    Never coerce analytical values to integer here:
-    amounts, percentages, ratios and statistical measures may be fractional.
-    Invalid values become NaN.
+    Invalid values become null.
+
+    This replaces the previous Pandas:
+        pd.to_numeric(..., errors="coerce")
     """
-    if series is None:
-        return pd.Series(dtype="float64")
 
-    return pd.to_numeric(
-        series.astype("string").str.strip(),
-        errors="coerce",
-    ).astype("float64")
+    return (
+        pl.col(column)
+        .cast(pl.String, strict=False)
+        .str.strip_chars()
+        .str.replace_all(",", "")
+        .str.replace_all("₹", "")
+        .str.replace_all(
+            r"(?i)\brs\.?\b",
+            "",
+        )
+        .str.strip_chars()
+        .cast(pl.Float64, strict=False)
+        .alias(column)
+    )
 
 
-def parse_dates(
-    df: pd.DataFrame,
-    columns: Iterable[str],
-) -> pd.DataFrame:
-    """Parse available date fields; malformed dates become NaT."""
+def date_expr(column: str) -> pl.Expr:
+    """
+    Parse a source date column using explicit formats.
+
+    Invalid values become null.
+
+    The result is normalized to Polars Date because all current
+    feature calculations operate at calendar-day precision.
+    """
+
+    value = (
+        pl.col(column)
+        .cast(pl.String, strict=False)
+        .str.strip_chars()
+    )
+
+    expressions = [
+        value.str.strptime(
+            pl.Datetime,
+            format=fmt,
+            strict=False,
+        )
+        for fmt in DATE_FORMATS
+    ]
+
+    return (
+        pl.coalesce(expressions)
+        .cast(pl.Date, strict=False)
+        .alias(column)
+    )
+
+
+def clean_text_expr(column: str) -> pl.Expr:
+    """
+    Deterministically normalize text for matching/search.
+
+    Null values become empty strings.
+    """
+
+    return (
+        pl.col(column)
+        .cast(pl.String, strict=False)
+        .fill_null("")
+        .str.to_lowercase()
+        .str.replace_all(r"\s+", " ")
+        .str.strip_chars()
+        .alias(column)
+    )
+
+
+def clean_optional_text_expr(column: str) -> pl.Expr:
+    """
+    Normalize optional text while retaining nulls.
+    """
+
+    return (
+        pl.col(column)
+        .cast(pl.String, strict=False)
+        .str.replace_all(r"\s+", " ")
+        .str.strip_chars()
+        .alias(column)
+    )
+
+
+# ============================================================
+# DATAFRAME HELPERS
+# ============================================================
+
+def ensure_columns(
+    df: pl.DataFrame,
+    columns: tuple[str, ...],
+) -> pl.DataFrame:
+    """
+    Create absent analytical columns as null values.
+
+    Existing columns are never overwritten.
+    """
+
+    expressions: list[pl.Expr] = []
+
     for column in columns:
-        if column in df.columns:
-            df[column] = pd.to_datetime(
-                df[column],
-                errors="coerce",
+
+        if column not in df.columns:
+            expressions.append(
+                pl.lit(None)
+                .cast(pl.String)
+                .alias(column)
             )
+
+    if expressions:
+        df = df.with_columns(expressions)
+
     return df
 
 
-def clean_text(series: pd.Series) -> pd.Series:
-    """Deterministically normalize free text for matching/search."""
-    return (
-        series.fillna("")
-        .astype("string")
-        .str.lower()
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-
-
-def make_link_key(df: pd.DataFrame) -> pd.Series:
+def ensure_typed_columns(
+    df: pl.DataFrame,
+) -> pl.DataFrame:
     """
-    Backward-compatible work linkage key.
+    Ensure all required analytical columns exist with useful
+    Polars dtypes.
 
-    Existing source design uses Work + IDA. We preserve that linkage key but
-    create a separate stable work_uid for downstream API/dashboard identity.
+    This is intentionally explicit so downstream modules receive
+    predictable schemas.
     """
-    work = df.get(
+
+    # --------------------------------------------------------
+    # Text columns
+    # --------------------------------------------------------
+
+    for column in (
         "work",
-        pd.Series(index=df.index, dtype="string"),
-    )
-    ida = df.get(
+        "work_description",
+        "state",
+        "district",
+        "mp",
+        "constituency",
         "ida",
-        pd.Series(index=df.index, dtype="string"),
-    )
+        "work_category",
+        "work_status",
+        "vendor_name",
+        "payment_status",
+        "financial_year",
+        "link_key",
+        "work_text",
+        "work_uid",
+        "expenditure_source",
+        "pipeline_version",
+    ):
+        if column not in df.columns:
+            df = df.with_columns(
+                pl.lit(None)
+                .cast(pl.String)
+                .alias(column)
+            )
+
+    # --------------------------------------------------------
+    # Numeric columns
+    # --------------------------------------------------------
+
+    for column in (
+        "sanction_amount",
+        "recommended_amount",
+        "completed_amount",
+        "allocated_amount",
+        "total_expenditure",
+        "expenditure_variance_amount",
+        "expenditure_variance_pct",
+        "utilization_pct",
+        "overspend_pct",
+        "overrun_pct",
+        "disbursement_to_sanction_ratio",
+        "days_rec_to_sanction",
+        "days_sanction_to_complete",
+        "days_open_since_sanction",
+        "days_since_last_expenditure",
+        "days_over_general_one_year_benchmark",
+        "duplicate_group_count",
+        "num_transactions",
+        "num_vendors",
+        "data_quality_issue_count",
+    ):
+        if column not in df.columns:
+            df = df.with_columns(
+                pl.lit(None)
+                .cast(pl.Float64)
+                .alias(column)
+            )
+
+    # --------------------------------------------------------
+    # Boolean columns
+    # --------------------------------------------------------
+
+    for column in (
+        "is_completed",
+        "is_open",
+        "is_duplicate_candidate",
+        "bad_recommendation_date",
+        "bad_completion_date",
+        "future_sanction_date",
+        "future_completion_date",
+        "negative_sanction_amount",
+        "negative_expenditure",
+        "missing_sanction_amount",
+        "missing_sanction_date",
+    ):
+        if column not in df.columns:
+            df = df.with_columns(
+                pl.lit(False).alias(column)
+            )
+
+    # --------------------------------------------------------
+    # Date columns
+    # --------------------------------------------------------
+
+    for column in (
+        "recommended_date",
+        "sanction_date",
+        "completion_date",
+        "first_expenditure_date",
+        "last_expenditure_date",
+        "monitoring_as_of_date",
+    ):
+        if column not in df.columns:
+            df = df.with_columns(
+                pl.lit(None)
+                .cast(pl.Date)
+                .alias(column)
+            )
+
+    return df
+
+
+# ============================================================
+# DATE NORMALIZATION
+# ============================================================
+
+def normalize_dates(
+    df: pl.DataFrame,
+    columns: tuple[str, ...],
+) -> pl.DataFrame:
+    """
+    Normalize all available date columns to Polars Date.
+    """
+
+    expressions = [
+        date_expr(column)
+        for column in columns
+        if column in df.columns
+    ]
+
+    if expressions:
+        df = df.with_columns(expressions)
+
+    return df
+
+
+# ============================================================
+# LINK KEY
+# ============================================================
+
+def make_link_key(df: pl.DataFrame) -> pl.Series:
+    """
+    Create the backward-compatible work linkage key.
+
+    Existing MPLADS source design uses:
+
+        Work + IDA
+
+    The linkage is normalized to:
+
+        normalized_work|normalized_ida
+
+    When both Work and IDA are missing, the resulting key is null.
+    """
+
+    height = df.height
+
+    # --------------------------------------------------------
+    # Work
+    # --------------------------------------------------------
+
+    if "work" in df.columns:
+        work = (
+            df["work"]
+            .cast(pl.String, strict=False)
+            .fill_null("")
+            .str.strip_chars()
+            .str.to_lowercase()
+        )
+    else:
+        work = pl.Series(
+            "work",
+            [""] * height,
+            dtype=pl.String,
+        )
+
+    # --------------------------------------------------------
+    # IDA
+    # --------------------------------------------------------
+
+    if "ida" in df.columns:
+        ida = (
+            df["ida"]
+            .cast(pl.String, strict=False)
+            .fill_null("")
+            .str.strip_chars()
+            .str.to_lowercase()
+        )
+    else:
+        ida = pl.Series(
+            "ida",
+            [""] * height,
+            dtype=pl.String,
+        )
+
+    # --------------------------------------------------------
+    # Build linkage key
+    # --------------------------------------------------------
 
     key = (
-        work.fillna("").astype("string").str.strip().str.lower()
+        work
         + "|"
-        + ida.fillna("").astype("string").str.strip().str.lower()
+        + ida
     )
+
+    # --------------------------------------------------------
+    # Do not create a misleading key when both source fields
+    # are actually missing.
+    # --------------------------------------------------------
 
     if "work" in df.columns and "ida" in df.columns:
-        both_missing = df["work"].isna() & df["ida"].isna()
-        key.loc[both_missing] = pd.NA
 
-    return key
+        both_missing = (
+            df["work"].is_null()
+            & df["ida"].is_null()
+        )
+
+        key = key.zip_with(
+            ~both_missing,
+            pl.Series(
+                "null_key",
+                [None] * height,
+                dtype=pl.String,
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Return a correctly named Series.
+    #
+    # Series.rename() returns a new Series; it does not mutate
+    # the existing Series name.
+    # --------------------------------------------------------
+
+    return key.rename("link_key")
 
 
-def stable_work_uid(row: pd.Series) -> str:
+# ============================================================
+# STABLE WORK UID
+# ============================================================
+
+def _stable_hash(value: str) -> str:
     """
-    Create a stable record identifier.
+    Generate a deterministic SHA-1 identifier.
 
-    Prefer a source-provided ID. Otherwise hash stable business attributes.
+    SHA-1 is used here only as a deterministic record fingerprint,
+    not for security.
     """
-    for candidate in ("work_id", "id", "work_code", "link_key"):
+
+    return hashlib.sha1(
+        value.encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def _stable_value(value: object) -> str:
+    """
+    Convert a value into a deterministic normalized string.
+    """
+
+    if value is None:
+        return ""
+
+    text = str(value).strip().lower()
+
+    return text
+
+
+def stable_work_uid(
+    row: dict[str, object],
+) -> str:
+    """
+    Create a stable work identifier.
+
+    Priority:
+
+        1. work_id
+        2. id
+        3. work_code
+        4. link_key
+        5. deterministic business-attribute hash
+
+    The same strategy as the existing implementation is retained.
+    """
+
+    for candidate in (
+        "work_id",
+        "id",
+        "work_code",
+        "link_key",
+    ):
+
         value = row.get(candidate)
-        if pd.notna(value) and str(value).strip():
-            return str(value).strip()
+
+        if value is not None:
+
+            normalized = _stable_value(value)
+
+            if normalized:
+                return normalized
 
     fields = [
-        row.get("state", ""),
-        row.get("ida", ""),
-        row.get("mp", ""),
-        row.get("constituency", ""),
-        row.get("work", ""),
-        row.get("recommended_date", ""),
-        row.get("sanction_date", ""),
-        row.get("sanction_amount", ""),
+        row.get("state"),
+        row.get("ida"),
+        row.get("mp"),
+        row.get("constituency"),
+        row.get("work"),
+        row.get("recommended_date"),
+        row.get("sanction_date"),
+        row.get("sanction_amount"),
     ]
+
     payload = "|".join(
-        "" if pd.isna(value) else str(value).strip().lower()
+        _stable_value(value)
         for value in fields
     )
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:20]
+
+    return _stable_hash(payload)
 
 
-def financial_year_from_date(series: pd.Series) -> pd.Series:
-    """Return Indian financial-year labels such as 2025-26."""
-    result = pd.Series(
-        pd.NA,
-        index=series.index,
-        dtype="string",
-    )
-    valid = series.notna()
+def add_stable_work_uid(
+    df: pl.DataFrame,
+) -> pl.DataFrame:
+    """
+    Add deterministic work_uid values.
+    """
 
-    years = series.loc[valid].dt.year
-    months = series.loc[valid].dt.month
-    start_year = np.where(months >= 4, years, years - 1)
+    # Convert rows only for this identifier-generation operation.
+    #
+    # The analytical dataframe remains entirely Polars-based.
+    #
 
-    result.loc[valid] = [
-        f"{year}-{str(year + 1)[-2:]}"
-        for year in start_year
+    rows = df.select(
+        [
+            column
+            for column in (
+                "work_id",
+                "id",
+                "work_code",
+                "link_key",
+                "state",
+                "ida",
+                "mp",
+                "constituency",
+                "work",
+                "recommended_date",
+                "sanction_date",
+                "sanction_amount",
+            )
+            if column in df.columns
+        ]
+    ).to_dicts()
+
+    uids = [
+        stable_work_uid(row)
+        for row in rows
     ]
-    return result
+
+    return df.with_columns(
+        pl.Series(
+            "work_uid",
+            uids,
+            dtype=pl.String,
+        )
+    )
 
 
-def get_as_of_date() -> pd.Timestamp:
+# ============================================================
+# WORK UID VALIDATION
+# ============================================================
+
+def validate_unique_work_uid(
+    df: pl.DataFrame,
+) -> None:
+    """
+    Fail early if stable work identifiers are duplicated.
+    """
+
+    if "work_uid" not in df.columns:
+        raise ValueError(
+            "Missing required column: work_uid"
+        )
+
+    duplicate_mask = (
+        df["work_uid"]
+        .is_duplicated()
+        & df["work_uid"].is_not_null()
+    )
+
+    if not duplicate_mask.any():
+        return
+
+    examples = (
+        df
+        .filter(duplicate_mask)
+        .select("work_uid")
+        .head(10)
+        .to_series()
+        .to_list()
+    )
+
+    raise ValueError(
+        "Duplicate work_uid values detected. "
+        f"Examples: {examples}"
+    )
+
+
+# ============================================================
+# FINANCIAL YEAR
+# ============================================================
+
+def financial_year_expr(
+    date_column: str,
+) -> pl.Expr:
+    """
+    Derive Indian financial-year labels.
+
+    Examples:
+
+        2025-03-31 -> 2024-25
+        2025-04-01 -> 2025-26
+    """
+
+    return (
+        pl.when(pl.col(date_column).is_null())
+        .then(pl.lit(None, dtype=pl.String))
+        .when(pl.col(date_column).dt.month() >= 4)
+        .then(
+            pl.concat_str(
+                [
+                    pl.col(date_column)
+                    .dt.year()
+                    .cast(pl.String),
+
+                    pl.lit("-"),
+
+                    (
+                        pl.col(date_column)
+                        .dt.year()
+                        .add(1)
+                        .mod(100)
+                        .cast(pl.String)
+                        .str.zfill(2)
+                    ),
+                ]
+            )
+        )
+        .otherwise(
+            pl.concat_str(
+                [
+                    (
+                        pl.col(date_column)
+                        .dt.year()
+                        .sub(1)
+                        .cast(pl.String)
+                    ),
+
+                    pl.lit("-"),
+
+                    (
+                        pl.col(date_column)
+                        .dt.year()
+                        .mod(100)
+                        .cast(pl.String)
+                        .str.zfill(2)
+                    ),
+                ]
+            )
+        )
+        .alias("derived_financial_year")
+    )
+
+
+# ============================================================
+# MONITORING SNAPSHOT
+# ============================================================
+
+def get_as_of_date() -> date:
     """
     Resolve the monitoring snapshot date.
 
-    Production/batch jobs should set MPLADS_AS_OF_DATE explicitly so results
-    are reproducible across machines and reruns.
+    Production/batch jobs should set:
+
+        MPLADS_AS_OF_DATE=YYYY-MM-DD
+
+    so that monitoring results are reproducible.
+
+    If it is not supplied, today's local system date is used.
     """
-    raw = os.getenv("MPLADS_AS_OF_DATE", "").strip()
+
+    raw = os.getenv(
+        "MPLADS_AS_OF_DATE",
+        "",
+    ).strip()
 
     if raw:
-        parsed = pd.to_datetime(raw, errors="coerce")
-        if pd.notna(parsed):
-            return parsed.normalize()
-        raise ValueError(
-            f"Invalid MPLADS_AS_OF_DATE: {raw!r}. "
-            "Expected YYYY-MM-DD."
+
+        try:
+            return datetime.strptime(
+                raw,
+                "%Y-%m-%d",
+            ).date()
+
+        except ValueError as exc:
+
+            raise ValueError(
+                f"Invalid MPLADS_AS_OF_DATE: {raw!r}. "
+                "Expected YYYY-MM-DD."
+            ) from exc
+
+    return datetime.now().date()
+
+
+# ============================================================
+# EXPENDITURE SUMMARY
+# ============================================================
+
+def build_expenditure_summary(
+    data: dict[str, pl.DataFrame],
+) -> pl.DataFrame:
+    """
+    Aggregate expenditure transactions by link_key.
+
+    Outputs:
+
+        link_key
+        total_expenditure
+        num_transactions
+        num_vendors
+        first_expenditure_date
+        last_expenditure_date
+
+    Transaction-level expenditure remains authoritative for
+    financial totals.
+    """
+
+    expenditure = data.get(
+        "expenditure"
+    )
+
+    if expenditure is None:
+        return pl.DataFrame(
+            schema={
+                "link_key": pl.String,
+                "total_expenditure": pl.Float64,
+                "num_transactions": pl.Int64,
+                "num_vendors": pl.Int64,
+                "first_expenditure_date": pl.Date,
+                "last_expenditure_date": pl.Date,
+            }
         )
 
-    return DEFAULT_AS_OF_DATE
+    if expenditure.is_empty():
 
-
-def ensure_columns(
-    df: pd.DataFrame,
-    columns: Iterable[str],
-) -> pd.DataFrame:
-    """Create absent optional columns as NA."""
-    for column in columns:
-        if column not in df.columns:
-            df[column] = pd.NA
-    return df
-
-
-def validate_unique_work_uid(df: pd.DataFrame) -> None:
-    """Fail early if stable work identifiers are duplicated."""
-    if "work_uid" not in df.columns:
-        raise ValueError("Missing required column: work_uid")
-
-    duplicated = df["work_uid"].duplicated(keep=False)
-    if duplicated.any():
-        examples = (
-            df.loc[duplicated, "work_uid"]
-            .astype("string")
-            .dropna()
-            .head(10)
-            .tolist()
+        return pl.DataFrame(
+            schema={
+                "link_key": pl.String,
+                "total_expenditure": pl.Float64,
+                "num_transactions": pl.Int64,
+                "num_vendors": pl.Int64,
+                "first_expenditure_date": pl.Date,
+                "last_expenditure_date": pl.Date,
+            }
         )
-        raise ValueError(
-            "Duplicate work_uid values detected. "
-            f"Examples: {examples}"
+
+    # --------------------------------------------------------
+    # Normalize source fields.
+    # --------------------------------------------------------
+
+    expenditure = normalize_dates(
+        expenditure,
+        ("expenditure_date",),
+    )
+
+    if "fund_disbursed_amount" in expenditure.columns:
+
+        expenditure = expenditure.with_columns(
+            numeric_expr(
+                "fund_disbursed_amount"
+            )
         )
+
+    # --------------------------------------------------------
+    # Link key.
+    # --------------------------------------------------------
+
+    expenditure = expenditure.with_columns(
+        make_link_key(expenditure)
+    )
+
+    expenditure = expenditure.filter(
+        pl.col("link_key").is_not_null()
+    )
+
+    if expenditure.is_empty():
+
+        return pl.DataFrame(
+            schema={
+                "link_key": pl.String,
+                "total_expenditure": pl.Float64,
+                "num_transactions": pl.Int64,
+                "num_vendors": pl.Int64,
+                "first_expenditure_date": pl.Date,
+                "last_expenditure_date": pl.Date,
+            }
+        )
+
+    # --------------------------------------------------------
+    # Transaction count.
+    # --------------------------------------------------------
+
+    if "work_id" in expenditure.columns:
+
+        transaction_count = (
+            pl.col("work_id")
+            .count()
+            .alias("num_transactions")
+        )
+
+    else:
+
+        transaction_count = (
+            pl.len()
+            .alias("num_transactions")
+        )
+
+    # --------------------------------------------------------
+    # Vendor count.
+    # --------------------------------------------------------
+
+    if "vendor_name" in expenditure.columns:
+
+        vendor_count = (
+            pl.col("vendor_name")
+            .cast(pl.String, strict=False)
+            .str.strip_chars()
+            .filter(
+                pl.col("vendor_name")
+                .cast(pl.String, strict=False)
+                .str.strip_chars()
+                .ne("")
+            )
+            .n_unique()
+            .alias("num_vendors")
+        )
+
+    else:
+
+        vendor_count = (
+            pl.lit(0)
+            .cast(pl.Int64)
+            .alias("num_vendors")
+        )
+
+    # --------------------------------------------------------
+    # Aggregate.
+    # --------------------------------------------------------
+
+    summary = (
+        expenditure
+        .group_by("link_key")
+        .agg(
+            pl.col("fund_disbursed_amount")
+            .sum()
+            .alias("total_expenditure"),
+
+            transaction_count,
+
+            vendor_count,
+
+            pl.col("expenditure_date")
+            .min()
+            .alias("first_expenditure_date"),
+
+            pl.col("expenditure_date")
+            .max()
+            .alias("last_expenditure_date"),
+        )
+    )
+
+    return summary.with_columns(
+        pl.col("total_expenditure")
+        .cast(pl.Float64, strict=False)
+    )
 
 
 # ============================================================
 # MASTER WORK TABLE
 # ============================================================
 
-def build_master(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    sanctioned = data["sanctioned"].copy()
-    recommended = data["recommended"].copy()
-    completed = data["completed"].copy()
-    allocation = data["allocation"].copy()
+def build_master(
+    data: dict[str, pl.DataFrame],
+) -> pl.DataFrame:
+    """
+    Build the master analytical work table.
+
+    Master grain:
+
+        One row per linked sanctioned work.
+
+    Existing analytical methodology is preserved:
+
+        sanctioned
+            ↓
+        recommended metadata
+            ↓
+        completed metadata
+            ↓
+        expenditure transaction summary
+            ↓
+        allocation
+            ↓
+        financial metrics
+            ↓
+        time metrics
+            ↓
+        duplicate indicators
+            ↓
+        data-quality indicators
+            ↓
+        stable work UID
+    """
+
+    # ========================================================
+    # SOURCE DATA
+    # ========================================================
+
+    required_sources = (
+        "sanctioned",
+        "recommended",
+        "completed",
+        "allocation",
+    )
+
+    missing_sources = [
+        source
+        for source in required_sources
+        if source not in data
+    ]
+
+    if missing_sources:
+
+        raise KeyError(
+            "Missing required datasets: "
+            f"{missing_sources}"
+        )
+
+    sanctioned = data["sanctioned"]
+    recommended = data["recommended"]
+    completed = data["completed"]
+    allocation = data["allocation"]
+
     expenditure = data.get(
         "expenditure",
-        pd.DataFrame(),
-    ).copy()
+        pl.DataFrame(),
+    )
 
-    # --------------------------------------------------------
-    # Standardize source-level numeric fields BEFORE merges.
-    # --------------------------------------------------------
-
-    numeric_map = {
-        "sanctioned": ["sanction_amount"],
-        "recommended": ["recommended_amount"],
-        "completed": ["amount_disbursed"],
-        "allocation": ["allocated_amount"],
-        "expenditure": ["fund_disbursed_amount"],
-    }
+    # ========================================================
+    # SOURCE NORMALIZATION
+    # ========================================================
 
     source_frames = {
         "sanctioned": sanctioned,
@@ -237,157 +1019,365 @@ def build_master(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
         "expenditure": expenditure,
     }
 
-    for name, columns in numeric_map.items():
-        frame = source_frames[name]
-        for column in columns:
+    numeric_map = {
+        "sanctioned": (
+            "sanction_amount",
+        ),
+        "recommended": (
+            "recommended_amount",
+        ),
+        "completed": (
+            "amount_disbursed",
+        ),
+        "allocation": (
+            "allocated_amount",
+        ),
+        "expenditure": (
+            "fund_disbursed_amount",
+        ),
+    }
+
+    date_map = {
+        "sanctioned": (
+            "recommended_date",
+            "sanction_date",
+        ),
+        "recommended": (
+            "recommended_date",
+            "sanction_date",
+        ),
+        "completed": (
+            "completion_date",
+        ),
+        "expenditure": (
+            "expenditure_date",
+        ),
+        "allocation": (),
+    }
+
+    normalized_sources: dict[
+        str,
+        pl.DataFrame,
+    ] = {}
+
+    for name, frame in source_frames.items():
+
+        if frame is None or frame.is_empty():
+
+            normalized_sources[name] = frame
+
+            continue
+
+        expressions: list[pl.Expr] = []
+
+        for column in numeric_map.get(
+            name,
+            (),
+        ):
+
             if column in frame.columns:
-                frame[column] = numeric(frame[column])
+                expressions.append(
+                    numeric_expr(column)
+                )
+
+        for column in date_map.get(
+            name,
+            (),
+        ):
+
+            if column in frame.columns:
+                expressions.append(
+                    date_expr(column)
+                )
+
+        if expressions:
+            frame = frame.with_columns(
+                expressions
+            )
+
+        normalized_sources[name] = frame
+
+    sanctioned = normalized_sources["sanctioned"]
+    recommended = normalized_sources["recommended"]
+    completed = normalized_sources["completed"]
+    allocation = normalized_sources["allocation"]
+    expenditure = normalized_sources["expenditure"]
+
+    # ========================================================
+    # LINK KEYS
+    # ========================================================
+
+    sanctioned = sanctioned.with_columns(
+        make_link_key(sanctioned)
+    )
+
+    recommended = recommended.with_columns(
+        make_link_key(recommended)
+    )
+
+    completed = completed.with_columns(
+        make_link_key(completed)
+    )
+
+    if expenditure is not None and not expenditure.is_empty():
+
+        expenditure = expenditure.with_columns(
+            make_link_key(expenditure)
+        )
+
+    # ========================================================
+    # MASTER = SANCTIONED WORKS
+    # ========================================================
+
+    sanctioned = sanctioned.filter(
+        pl.col("link_key").is_not_null()
+    )
+
+    if sanctioned.is_empty():
+
+        raise ValueError(
+            "No valid sanctioned works remain after "
+            "link-key generation."
+        )
 
     # --------------------------------------------------------
-    # Standardize source dates BEFORE merges.
+    # One row per link_key.
+    #
+    # Latest sanction_date wins when duplicates exist.
     # --------------------------------------------------------
-
-    date_columns = [
-        "recommended_date",
-        "sanction_date",
-        "completion_date",
-        "expenditure_date",
-    ]
-
-    for frame in (
-        sanctioned,
-        recommended,
-        completed,
-        expenditure,
-    ):
-        parse_dates(frame, date_columns)
-
-    # --------------------------------------------------------
-    # Link keys.
-    # --------------------------------------------------------
-
-    sanctioned["link_key"] = make_link_key(sanctioned)
-    recommended["link_key"] = make_link_key(recommended)
-    completed["link_key"] = make_link_key(completed)
-
-    if not expenditure.empty:
-        expenditure["link_key"] = make_link_key(expenditure)
-
-    # --------------------------------------------------------
-    # MASTER = sanctioned works.
-    # One row per linked work.
-    # --------------------------------------------------------
-
-    sanctioned = sanctioned.dropna(subset=["link_key"]).copy()
 
     if "sanction_date" in sanctioned.columns:
+
         sanctioned = (
             sanctioned
-            .sort_values(
-                ["link_key", "sanction_date"],
-                na_position="last",
+            .sort(
+                [
+                    "link_key",
+                    "sanction_date",
+                ],
+                nulls_last=True,
             )
-            .drop_duplicates(
-                "link_key",
+            .unique(
+                subset=["link_key"],
                 keep="last",
+                maintain_order=True,
             )
         )
+
     else:
-        sanctioned = sanctioned.drop_duplicates(
-            "link_key",
+
+        sanctioned = sanctioned.unique(
+            subset=["link_key"],
             keep="last",
+            maintain_order=True,
         )
 
-    master = sanctioned.copy()
+    master = sanctioned
 
-    # --------------------------------------------------------
-    # Recommended amount.
-    # Do not merge recommended_date again when it already exists in
-    # the sanctioned source schema.
-    # --------------------------------------------------------
+    # ========================================================
+    # RECOMMENDED AMOUNT
+    # ========================================================
 
-    recommended_small = (
-        recommended.dropna(subset=["link_key"])
-        .sort_values(
-            ["link_key", "recommended_date"],
-            na_position="last",
+    if (
+        not recommended.is_empty()
+        and "recommended_amount"
+        in recommended.columns
+    ):
+
+        recommended_small = recommended.filter(
+            pl.col("link_key").is_not_null()
         )
-        .drop_duplicates(
-            "link_key",
-            keep="last",
-        )
-        [["link_key", "recommended_amount"]]
-        .copy()
-    )
 
-    master = master.merge(
-        recommended_small,
-        on="link_key",
-        how="left",
-        validate="one_to_one",
-    )
+        if "recommended_date" in recommended_small.columns:
 
-    # --------------------------------------------------------
-    # Completed metadata.
-    # Financial totals are calculated independently from expenditure
-    # transactions, not from the latest completion row.
-    # --------------------------------------------------------
+            recommended_small = (
+                recommended_small
+                .sort(
+                    [
+                        "link_key",
+                        "recommended_date",
+                    ],
+                    nulls_last=True,
+                )
+                .unique(
+                    subset=["link_key"],
+                    keep="last",
+                    maintain_order=True,
+                )
+            )
 
-    completed_small = (
-        completed.dropna(subset=["link_key"])
-        .sort_values(
-            ["link_key", "completion_date"],
-            na_position="last",
+        else:
+
+            recommended_small = (
+                recommended_small
+                .unique(
+                    subset=["link_key"],
+                    keep="last",
+                    maintain_order=True,
+                )
+            )
+
+        recommended_small = recommended_small.select(
+            [
+                "link_key",
+                "recommended_amount",
+            ]
         )
-        .drop_duplicates(
-            "link_key",
-            keep="last",
+
+        master = master.join(
+            recommended_small,
+            on="link_key",
+            how="left",
+            validate="1:1",
         )
-        [["link_key", "completion_date", "amount_disbursed"]]
-        .rename(
-            columns={
-                "amount_disbursed": "completed_amount",
+
+    else:
+
+        master = master.with_columns(
+            pl.lit(None)
+            .cast(pl.Float64)
+            .alias("recommended_amount")
+        )
+
+    # ========================================================
+    # COMPLETED METADATA
+    # ========================================================
+
+    if not completed.is_empty():
+
+        completed_small = completed.filter(
+            pl.col("link_key").is_not_null()
+        )
+
+        if "completion_date" in completed_small.columns:
+
+            completed_small = (
+                completed_small
+                .sort(
+                    [
+                        "link_key",
+                        "completion_date",
+                    ],
+                    nulls_last=True,
+                )
+                .unique(
+                    subset=["link_key"],
+                    keep="last",
+                    maintain_order=True,
+                )
+            )
+
+        else:
+
+            completed_small = (
+                completed_small
+                .unique(
+                    subset=["link_key"],
+                    keep="last",
+                    maintain_order=True,
+                )
+            )
+
+        selected = ["link_key"]
+
+        if "completion_date" in completed_small.columns:
+            selected.append("completion_date")
+
+        if "amount_disbursed" in completed_small.columns:
+            selected.append("amount_disbursed")
+
+        completed_small = completed_small.select(
+            selected
+        )
+
+        if "amount_disbursed" in completed_small.columns:
+
+            completed_small = completed_small.rename(
+                {
+                    "amount_disbursed":
+                    "completed_amount"
+                }
+            )
+
+        else:
+
+            completed_small = completed_small.with_columns(
+                pl.lit(None)
+                .cast(pl.Float64)
+                .alias("completed_amount")
+            )
+
+        master = master.join(
+            completed_small,
+            on="link_key",
+            how="left",
+            validate="1:1",
+        )
+
+    else:
+
+        master = master.with_columns(
+            [
+                pl.lit(None)
+                .cast(pl.Date)
+                .alias("completion_date"),
+
+                pl.lit(None)
+                .cast(pl.Float64)
+                .alias("completed_amount"),
+            ]
+        )
+
+    # ========================================================
+    # EXPENDITURE SUMMARY
+    # ========================================================
+
+    expenditure_summary = (
+        build_expenditure_summary(
+            {
+                "expenditure": expenditure
             }
         )
-        .copy()
     )
 
-    master = master.merge(
-        completed_small,
-        on="link_key",
-        how="left",
-        validate="one_to_one",
-    )
+    if not expenditure_summary.is_empty():
 
-    # --------------------------------------------------------
-    # Expenditure transaction summary.
-    # --------------------------------------------------------
-
-    expenditure_summary = build_expenditure_summary(
-        {"expenditure": expenditure}
-    )
-
-    if not expenditure_summary.empty:
-        master = master.merge(
+        master = master.join(
             expenditure_summary,
             on="link_key",
             how="left",
-            validate="one_to_one",
+            validate="1:1",
         )
-    else:
-        for column in (
-            "total_expenditure",
-            "num_transactions",
-            "num_vendors",
-            "first_expenditure_date",
-            "last_expenditure_date",
-        ):
-            master[column] = pd.NA
 
-    # --------------------------------------------------------
-    # Allocation.
-    # If financial_year exists in allocation data, preserve it.
-    # --------------------------------------------------------
+    else:
+
+        master = master.with_columns(
+            [
+                pl.lit(None)
+                .cast(pl.Float64)
+                .alias("total_expenditure"),
+
+                pl.lit(None)
+                .cast(pl.Int64)
+                .alias("num_transactions"),
+
+                pl.lit(None)
+                .cast(pl.Int64)
+                .alias("num_vendors"),
+
+                pl.lit(None)
+                .cast(pl.Date)
+                .alias("first_expenditure_date"),
+
+                pl.lit(None)
+                .cast(pl.Date)
+                .alias("last_expenditure_date"),
+            ]
+        )
+
+    # ========================================================
+    # ALLOCATION
+    # ========================================================
 
     allocation_columns = [
         column
@@ -397,336 +1387,709 @@ def build_master(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
             "constituency",
         )
         if column in allocation.columns
+        and column in master.columns
     ]
 
     if "financial_year" in allocation.columns:
-        allocation_columns.append("financial_year")
+        allocation_columns.append(
+            "financial_year"
+        )
 
     if allocation_columns:
-        allocation = allocation.dropna(
-            subset=allocation_columns
+
+        allocation = allocation.filter(
+            pl.all_horizontal(
+                [
+                    pl.col(column)
+                    .is_not_null()
+                    for column in allocation_columns
+                ]
+            )
         )
 
-    if allocation.empty or not allocation_columns:
-        master["allocated_amount"] = pd.NA
-    else:
+    if (
+        not allocation.is_empty()
+        and allocation_columns
+        and "allocated_amount"
+        in allocation.columns
+    ):
+
         allocation_small = (
             allocation
-            .groupby(
-                allocation_columns,
-                dropna=False,
-            )["allocated_amount"]
-            .max()
-            .reset_index()
+            .group_by(
+                allocation_columns
+            )
+            .agg(
+                pl.col("allocated_amount")
+                .max()
+                .alias("allocated_amount")
+            )
         )
 
-        join_cols = [
+        join_columns = [
             column
             for column in allocation_columns
             if column in master.columns
         ]
 
-        if join_cols:
-            master = master.merge(
+        if join_columns:
+
+            master = master.join(
                 allocation_small,
-                on=join_cols,
+                on=join_columns,
                 how="left",
-                validate="many_to_one",
+                validate="m:1",
             )
+
         else:
-            master["allocated_amount"] = pd.NA
 
-    # --------------------------------------------------------
-    # Required analytical columns.
-    # --------------------------------------------------------
+            master = master.with_columns(
+                pl.lit(None)
+                .cast(pl.Float64)
+                .alias("allocated_amount")
+            )
 
-    ensure_columns(
-        master,
-        [
-            "work",
-            "work_description",
-            "state",
-            "mp",
-            "constituency",
-            "ida",
-            "work_category",
-            "work_status",
-            "recommended_date",
-            "sanction_date",
-            "completion_date",
-            "sanction_amount",
-            "recommended_amount",
-            "completed_amount",
-            "allocated_amount",
-            "total_expenditure",
-            "first_expenditure_date",
-            "last_expenditure_date",
-        ],
-    )
+    else:
 
-    for column in (
+        master = master.with_columns(
+            pl.lit(None)
+            .cast(pl.Float64)
+            .alias("allocated_amount")
+        )
+
+    # ========================================================
+    # REQUIRED ANALYTICAL COLUMNS
+    # ========================================================
+
+    required_columns = (
+        "work",
+        "work_description",
+        "state",
+        "district",
+        "mp",
+        "constituency",
+        "ida",
+        "work_category",
+        "work_status",
+        "recommended_date",
+        "sanction_date",
+        "completion_date",
         "sanction_amount",
         "recommended_amount",
         "completed_amount",
         "allocated_amount",
         "total_expenditure",
+        "first_expenditure_date",
+        "last_expenditure_date",
+    )
+
+    # Add missing columns with nulls.
+    for column in required_columns:
+
+        if column not in master.columns:
+
+            if column.endswith("_date"):
+
+                dtype = pl.Date
+
+            elif column in FINANCIAL_COLUMNS:
+
+                dtype = pl.Float64
+
+            else:
+
+                dtype = pl.String
+
+            master = master.with_columns(
+                pl.lit(None)
+                .cast(dtype)
+                .alias(column)
+            )
+
+    # ========================================================
+    # FINAL TYPE NORMALIZATION
+    # ========================================================
+
+    expressions: list[pl.Expr] = []
+
+    for column in FINANCIAL_COLUMNS:
+
+        if column in master.columns:
+
+            expressions.append(
+                numeric_expr(column)
+            )
+
+    for column in (
+        "recommended_date",
+        "sanction_date",
+        "completion_date",
+        "first_expenditure_date",
+        "last_expenditure_date",
     ):
-        master[column] = numeric(master[column])
+
+        if column in master.columns:
+
+            expressions.append(
+                pl.col(column)
+                .cast(pl.Date, strict=False)
+                .alias(column)
+            )
+
+    if expressions:
+        master = master.with_columns(
+            expressions
+        )
+
+    # ========================================================
+    # COMPLETION STATUS
+    # ========================================================
+
+    master = master.with_columns(
+        [
+            pl.col("completion_date")
+            .is_not_null()
+            .alias("is_completed"),
+
+            pl.col("completion_date")
+            .is_null()
+            .alias("is_open"),
+        ]
+    )
+
+    # ========================================================
+    # EXPENDITURE SOURCE
+    # ========================================================
+
+    master = master.with_columns(
+        pl.when(
+            pl.col("total_expenditure")
+            .is_not_null()
+        )
+        .then(
+            pl.lit("transaction_sum")
+        )
+        .when(
+            pl.col("completed_amount")
+            .is_not_null()
+        )
+        .then(
+            pl.lit("completed_amount_fallback")
+        )
+        .otherwise(
+            pl.lit("missing")
+        )
+        .alias("expenditure_source")
+    )
 
     # --------------------------------------------------------
-    # Completion / financial metrics.
-    # --------------------------------------------------------
-
-    master["is_completed"] = master["completion_date"].notna()
-    master["is_open"] = ~master["is_completed"]
-
     # Transaction sum is authoritative whenever available.
-    master["expenditure_source"] = np.where(
-        master["total_expenditure"].notna(),
-        "transaction_sum",
-        np.where(
-            master["completed_amount"].notna(),
-            "completed_amount_fallback",
-            "missing",
-        ),
+    # Otherwise fall back to completed amount.
+    # --------------------------------------------------------
+
+    master = master.with_columns(
+        pl.coalesce(
+            [
+                pl.col("total_expenditure"),
+                pl.col("completed_amount"),
+            ]
+        )
+        .alias("total_expenditure")
     )
 
-    master["total_expenditure"] = (
-        master["total_expenditure"]
-        .fillna(master["completed_amount"])
+    # ========================================================
+    # FINANCIAL METRICS
+    # ========================================================
+
+    valid_sanction = (
+        pl.col("sanction_amount")
+        .is_not_null()
+        & pl.col("sanction_amount")
+        .gt(0)
     )
 
-    master["expenditure_variance_amount"] = (
-        master["total_expenditure"]
-        - master["sanction_amount"]
-    )
+    master = master.with_columns(
+        [
+            pl.when(valid_sanction)
+            .then(
+                pl.col("total_expenditure")
+                - pl.col("sanction_amount")
+            )
+            .otherwise(None)
+            .alias(
+                "expenditure_variance_amount"
+            ),
 
-    master["expenditure_variance_pct"] = (
-        master["expenditure_variance_amount"]
-        .div(master["sanction_amount"])
-        .mul(100.0)
-    )
+            pl.when(valid_sanction)
+            .then(
+                (
+                    (
+                        pl.col("total_expenditure")
+                        - pl.col("sanction_amount")
+                    )
+                    / pl.col("sanction_amount")
+                    * 100.0
+                )
+            )
+            .otherwise(None)
+            .alias(
+                "expenditure_variance_pct"
+            ),
 
-    master["utilization_pct"] = (
-        master["total_expenditure"]
-        .div(master["sanction_amount"])
-        .mul(100.0)
+            pl.when(valid_sanction)
+            .then(
+                (
+                    pl.col("total_expenditure")
+                    / pl.col("sanction_amount")
+                    * 100.0
+                )
+            )
+            .otherwise(None)
+            .alias(
+                "utilization_pct"
+            ),
+        ]
     )
 
     # Positive expenditure variance only.
-    master["overspend_pct"] = (
-        master["expenditure_variance_pct"]
-        .clip(lower=0.0)
-    )
-    # --------------------------------------------------------
-# Backward-compatible legacy model feature.
-#
-# IMPORTANT:
-# This alias is retained only because the existing trained
-# Isolation Forest was fitted on the historical name
-# "overrun_pct".
-#
-# Canonical analytical fields remain:
-#   expenditure_variance_pct
-#   overspend_pct
-# --------------------------------------------------------
-
-    master["overrun_pct"] = (
-    master["overspend_pct"]
+    master = master.with_columns(
+        pl.col("expenditure_variance_pct")
+        .clip(lower_bound=0.0)
+        .alias("overspend_pct")
     )
 
-    invalid_sanction = (
-        master["sanction_amount"].isna()
-        | master["sanction_amount"].le(0)
+    # ========================================================
+    # LEGACY MODEL FEATURE
+    # ========================================================
+    #
+    # The existing Isolation Forest historically used the
+    # feature name "overrun_pct".
+    #
+    # Preserve the alias so the existing model remains
+    # compatible.
+    #
+
+    master = master.with_columns(
+        pl.col("overspend_pct")
+        .alias("overrun_pct")
     )
 
-    for column in (
-        "expenditure_variance_pct",
-        "utilization_pct",
-        "overspend_pct",
-    ):
-        master.loc[invalid_sanction, column] = np.nan
+    # ========================================================
+    # DISBURSEMENT / SANCTION RATIO
+    # ========================================================
 
-    master["disbursement_to_sanction_ratio"] = (
-        master["utilization_pct"] / 100.0
+    master = master.with_columns(
+        pl.when(valid_sanction)
+        .then(
+            pl.col("total_expenditure")
+            / pl.col("sanction_amount")
+        )
+        .otherwise(None)
+        .alias(
+            "disbursement_to_sanction_ratio"
+        )
     )
 
-    # --------------------------------------------------------
-    # Time features.
-    # --------------------------------------------------------
+    # ========================================================
+    # TIME FEATURES
+    # ========================================================
 
-    master["days_rec_to_sanction"] = (
-        master["sanction_date"]
-        - master["recommended_date"]
-    ).dt.days
+    master = master.with_columns(
+        [
+            (
+                pl.col("sanction_date")
+                - pl.col("recommended_date")
+            )
+            .dt.total_days()
+            .cast(pl.Float64)
+            .alias(
+                "days_rec_to_sanction"
+            ),
 
-    master["days_sanction_to_complete"] = (
-        master["completion_date"]
-        - master["sanction_date"]
-    ).dt.days
+            (
+                pl.col("completion_date")
+                - pl.col("sanction_date")
+            )
+            .dt.total_days()
+            .cast(pl.Float64)
+            .alias(
+                "days_sanction_to_complete"
+            ),
+        ]
+    )
 
-    # --------------------------------------------------------
-    # Stable monitoring snapshot.
-    # --------------------------------------------------------
+    # ========================================================
+    # MONITORING SNAPSHOT
+    # ========================================================
 
     as_of_date = get_as_of_date()
 
-    master["monitoring_as_of_date"] = as_of_date
-
-    master["days_open_since_sanction"] = np.where(
-        master["is_open"] & master["sanction_date"].notna(),
-        (as_of_date - master["sanction_date"]).dt.days,
-        np.nan,
+    master = master.with_columns(
+        pl.lit(as_of_date)
+        .cast(pl.Date)
+        .alias("monitoring_as_of_date")
     )
-
-    master["days_open_since_sanction"] = (
-        pd.to_numeric(
-            master["days_open_since_sanction"],
-            errors="coerce",
-        )
-        .clip(lower=0)
-    )
-
-    master["days_since_last_expenditure"] = np.where(
-        master["is_open"]
-        & master["last_expenditure_date"].notna(),
-        (
-            as_of_date
-            - master["last_expenditure_date"]
-        ).dt.days,
-        np.nan,
-    )
-
-    master["days_since_last_expenditure"] = (
-        pd.to_numeric(
-            master["days_since_last_expenditure"],
-            errors="coerce",
-        )
-        .clip(lower=0)
-    )
-
-    # Analytical one-year benchmark; not itself a legal violation flag.
-    master["days_over_general_one_year_benchmark"] = (
-        master["days_open_since_sanction"]
-        - 365
-    ).clip(lower=0)
 
     # --------------------------------------------------------
-    # Financial year.
+    # Days open since sanction.
+    #
+    # Only open works with a valid sanction date are measured.
+    # Negative values are clipped to zero.
     # --------------------------------------------------------
+
+    master = master.with_columns(
+        pl.when(
+            pl.col("is_open")
+            & pl.col("sanction_date").is_not_null()
+        )
+        .then(
+            (
+                pl.lit(as_of_date)
+                - pl.col("sanction_date")
+            )
+            .dt.total_days()
+            .clip(lower_bound=0)
+            .cast(pl.Float64)
+        )
+        .otherwise(None)
+        .alias(
+            "days_open_since_sanction"
+        )
+    )
+
+    # --------------------------------------------------------
+    # Days since last expenditure.
+    # --------------------------------------------------------
+
+    master = master.with_columns(
+        pl.when(
+            pl.col("is_open")
+            & pl.col(
+                "last_expenditure_date"
+            ).is_not_null()
+        )
+        .then(
+            (
+                pl.lit(as_of_date)
+                - pl.col(
+                    "last_expenditure_date"
+                )
+            )
+            .dt.total_days()
+            .clip(lower_bound=0)
+            .cast(pl.Float64)
+        )
+        .otherwise(None)
+        .alias(
+            "days_since_last_expenditure"
+        )
+    )
+
+    # --------------------------------------------------------
+    # Analytical one-year benchmark.
+    #
+    # This is an analytical benchmark, not itself a legal
+    # violation flag.
+    # --------------------------------------------------------
+
+    master = master.with_columns(
+        pl.col(
+            "days_open_since_sanction"
+        )
+        .sub(
+            GENERAL_ONE_YEAR_BENCHMARK_DAYS
+        )
+        .clip(lower_bound=0)
+        .alias(
+            "days_over_general_one_year_benchmark"
+        )
+    )
+
+    # ========================================================
+    # FINANCIAL YEAR
+    # ========================================================
+
+    derived_fy = (
+        financial_year_expr(
+            "sanction_date"
+        )
+    )
 
     if "financial_year" in master.columns:
+
         supplied_fy = (
-            master["financial_year"]
-            .astype("string")
-            .str.strip()
+            pl.col("financial_year")
+            .cast(pl.String, strict=False)
+            .str.strip_chars()
         )
 
-        derived_fy = financial_year_from_date(
-            master["sanction_date"]
+        master = master.with_columns(
+            derived_fy
         )
 
-        master["financial_year"] = supplied_fy.where(
-            supplied_fy.notna()
-            & supplied_fy.ne(""),
-            derived_fy,
+        master = master.with_columns(
+            pl.when(
+                supplied_fy.is_not_null()
+                & supplied_fy.ne("")
+            )
+            .then(supplied_fy)
+            .otherwise(
+                pl.col(
+                    "derived_financial_year"
+                )
+            )
+            .alias("financial_year")
         )
+
+        master = master.drop(
+            "derived_financial_year"
+        )
+
     else:
-        master["financial_year"] = (
-            financial_year_from_date(
-                master["sanction_date"]
+
+        master = master.with_columns(
+            derived_fy
+        )
+
+        master = master.rename(
+            {
+                "derived_financial_year":
+                "financial_year"
+            }
+        )
+
+    # ========================================================
+    # TEXT NORMALIZATION
+    # ========================================================
+
+    if "work_description" in master.columns:
+
+        work_description = (
+            pl.col("work_description")
+            .cast(
+                pl.String,
+                strict=False,
             )
         )
 
-    # --------------------------------------------------------
-    # Text + conservative exact duplicate candidates.
-    # --------------------------------------------------------
+    else:
 
-    master["work_text"] = clean_text(
-        master["work_description"].fillna(
-            master["work"]
+        work_description = (
+            pl.lit(None)
+            .cast(pl.String)
         )
+
+    if "work" in master.columns:
+
+        work = (
+            pl.col("work")
+            .cast(
+                pl.String,
+                strict=False,
+            )
+        )
+
+    else:
+
+        work = (
+            pl.lit(None)
+            .cast(pl.String)
+        )
+
+    master = master.with_columns(
+        pl.coalesce(
+            [
+                work_description,
+                work,
+            ]
+        )
+        .fill_null("")
+        .str.to_lowercase()
+        .str.replace_all(
+            r"\s+",
+            " ",
+        )
+        .str.strip_chars()
+        .alias("work_text")
     )
+
+    # ========================================================
+    # EXACT DUPLICATE CANDIDATES
+    # ========================================================
 
     duplicate_keys = [
-        "state",
-        "constituency",
-        "ida",
-        "work_text",
+        column
+        for column in (
+            "state",
+            "constituency",
+            "ida",
+            "work_text",
+        )
+        if column in master.columns
     ]
 
-    valid_duplicate = (
-        master["work_text"].str.len().ge(8)
-    )
+    if duplicate_keys:
 
-    master["duplicate_group_count"] = 1
-
-    if valid_duplicate.any():
-        master.loc[valid_duplicate, "duplicate_group_count"] = (
-            master.loc[valid_duplicate]
-            .groupby(
-                duplicate_keys,
-                dropna=False,
-            )["link_key"]
-            .transform("size")
+        master = master.with_columns(
+            pl.when(
+                pl.col("work_text")
+                .str.len_chars()
+                .ge(
+                    MIN_DUPLICATE_TEXT_LENGTH
+                )
+            )
+            .then(
+                pl.col("work_text")
+                .count()
+                .over(duplicate_keys)
+            )
+            .otherwise(
+                pl.lit(1)
+            )
+            .cast(pl.Int64)
+            .alias(
+                "duplicate_group_count"
+            )
         )
 
-    master["is_duplicate_candidate"] = (
-        valid_duplicate
-        & master["duplicate_group_count"].gt(1)
-    )
-
-    # --------------------------------------------------------
-    # Date integrity.
-    # --------------------------------------------------------
-
-    master["bad_recommendation_date"] = (
-        master["recommended_date"].notna()
-        & master["sanction_date"].notna()
-        & master["sanction_date"].lt(
-            master["recommended_date"]
+        master = master.with_columns(
+            (
+                pl.col("work_text")
+                .str.len_chars()
+                .ge(
+                    MIN_DUPLICATE_TEXT_LENGTH
+                )
+                & pl.col(
+                    "duplicate_group_count"
+                ).gt(1)
+            )
+            .alias(
+                "is_duplicate_candidate"
+            )
         )
-    )
 
-    master["bad_completion_date"] = (
-        master["sanction_date"].notna()
-        & master["completion_date"].notna()
-        & master["completion_date"].lt(
-            master["sanction_date"]
+    else:
+
+        master = master.with_columns(
+            [
+                pl.lit(1)
+                .cast(pl.Int64)
+                .alias(
+                    "duplicate_group_count"
+                ),
+
+                pl.lit(False)
+                .alias(
+                    "is_duplicate_candidate"
+                ),
+            ]
         )
+
+    # ========================================================
+    # DATE INTEGRITY
+    # ========================================================
+
+    master = master.with_columns(
+        [
+            (
+                pl.col("recommended_date")
+                .is_not_null()
+                & pl.col("sanction_date")
+                .is_not_null()
+                & pl.col("sanction_date")
+                .lt(
+                    pl.col("recommended_date")
+                )
+            )
+            .alias(
+                "bad_recommendation_date"
+            ),
+
+            (
+                pl.col("sanction_date")
+                .is_not_null()
+                & pl.col("completion_date")
+                .is_not_null()
+                & pl.col("completion_date")
+                .lt(
+                    pl.col("sanction_date")
+                )
+            )
+            .alias(
+                "bad_completion_date"
+            ),
+
+            (
+                pl.col("sanction_date")
+                .is_not_null()
+                & pl.col("sanction_date")
+                .gt(
+                    pl.lit(as_of_date)
+                )
+            )
+            .alias(
+                "future_sanction_date"
+            ),
+
+            (
+                pl.col("completion_date")
+                .is_not_null()
+                & pl.col("completion_date")
+                .gt(
+                    pl.lit(as_of_date)
+                )
+            )
+            .alias(
+                "future_completion_date"
+            ),
+        ]
     )
 
-    master["future_sanction_date"] = (
-        master["sanction_date"].notna()
-        & master["sanction_date"].gt(as_of_date)
+    # ========================================================
+    # VALUE INTEGRITY
+    # ========================================================
+
+    master = master.with_columns(
+        [
+            (
+                pl.col("sanction_amount")
+                .is_not_null()
+                & pl.col("sanction_amount")
+                .lt(0)
+            )
+            .alias(
+                "negative_sanction_amount"
+            ),
+
+            (
+                pl.col("total_expenditure")
+                .is_not_null()
+                & pl.col("total_expenditure")
+                .lt(0)
+            )
+            .alias(
+                "negative_expenditure"
+            ),
+
+            pl.col("sanction_amount")
+            .is_null()
+            .alias(
+                "missing_sanction_amount"
+            ),
+
+            pl.col("sanction_date")
+            .is_null()
+            .alias(
+                "missing_sanction_date"
+            ),
+        ]
     )
 
-    master["future_completion_date"] = (
-        master["completion_date"].notna()
-        & master["completion_date"].gt(as_of_date)
-    )
+    # ========================================================
+    # DATA QUALITY ISSUE COUNT
+    # ========================================================
 
-    # --------------------------------------------------------
-    # Basic value-integrity / missingness indicators.
-    # --------------------------------------------------------
-
-    master["negative_sanction_amount"] = (
-        master["sanction_amount"].lt(0)
-    )
-
-    master["negative_expenditure"] = (
-        master["total_expenditure"].lt(0)
-    )
-
-    master["missing_sanction_amount"] = (
-        master["sanction_amount"].isna()
-    )
-
-    master["missing_sanction_date"] = (
-        master["sanction_date"].isna()
-    )
-
-    integrity_flags = [
+    integrity_flags = (
         "bad_recommendation_date",
         "bad_completion_date",
         "future_sanction_date",
@@ -735,244 +2098,385 @@ def build_master(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
         "negative_expenditure",
         "missing_sanction_amount",
         "missing_sanction_date",
+    )
+
+    master = master.with_columns(
+        pl.sum_horizontal(
+            [
+                pl.col(column)
+                .cast(pl.UInt8)
+                for column in integrity_flags
+            ]
+        )
+        .cast(pl.Int64)
+        .alias(
+            "data_quality_issue_count"
+        )
+    )
+
+    # ========================================================
+    # DATA QUALITY STATUS
+    # ========================================================
+
+    master = master.with_columns(
+        pl.when(
+            pl.col(
+                "data_quality_issue_count"
+            ).eq(0)
+        )
+        .then(pl.lit("GOOD"))
+        .when(
+            pl.col(
+                "data_quality_issue_count"
+            ).eq(1)
+        )
+        .then(pl.lit("WATCH"))
+        .when(
+            pl.col(
+                "data_quality_issue_count"
+            ).eq(2)
+        )
+        .then(pl.lit("POOR"))
+        .otherwise(
+            pl.lit("CRITICAL")
+        )
+        .alias(
+            "data_quality_status"
+        )
+    )
+
+    # ========================================================
+    # STABLE WORK UID
+    # ========================================================
+
+    master = add_stable_work_uid(
+        master
+    )
+
+    validate_unique_work_uid(
+        master
+    )
+
+    # ========================================================
+    # FINAL METADATA
+    # ========================================================
+
+    master = master.with_columns(
+        pl.lit(PIPELINE_VERSION)
+        .alias("pipeline_version")
+    )
+
+    # ========================================================
+    # FINAL SORT
+    # ========================================================
+
+    sort_columns = [
+        column
+        for column in (
+            "state",
+            "district",
+            "ida",
+            "work_uid",
+        )
+        if column in master.columns
     ]
 
-    master["data_quality_issue_count"] = (
-        master[integrity_flags]
-        .fillna(False)
-        .astype(int)
-        .sum(axis=1)
-    )
+    if sort_columns:
 
-    master["data_quality_status"] = pd.cut(
-        master["data_quality_issue_count"],
-        bins=[-1, 0, 1, 2, np.inf],
-        labels=[
-            "GOOD",
-            "WATCH",
-            "POOR",
-            "CRITICAL",
-        ],
-    )
-
-    # --------------------------------------------------------
-    # Stable work UID.
-    # --------------------------------------------------------
-
-    master["work_uid"] = master.apply(
-        stable_work_uid,
-        axis=1,
-    )
-
-    validate_unique_work_uid(master)
-
-    # --------------------------------------------------------
-    # Final metadata.
-    # --------------------------------------------------------
-
-    master["pipeline_version"] = PIPELINE_VERSION
-
-    master = (
-        master
-        .sort_values(
-            [
-                "state",
-                "district" if "district" in master.columns else "ida",
-                "work_uid",
-            ],
-            na_position="last",
+        master = master.sort(
+            sort_columns,
+            nulls_last=True,
         )
-        .reset_index(drop=True)
-    )
 
     return master
 
 
 # ============================================================
-# EXPENDITURE SUMMARY
+# SAVE MASTER / SUMMARY
 # ============================================================
 
-def build_expenditure_summary(
-    data: dict[str, pd.DataFrame],
-) -> pd.DataFrame:
-    expenditure = data.get(
-        "expenditure",
-        pd.DataFrame(),
-    ).copy()
-
-    if expenditure.empty:
-        return pd.DataFrame(
-            columns=[
-                "link_key",
-                "total_expenditure",
-                "num_transactions",
-                "num_vendors",
-                "first_expenditure_date",
-                "last_expenditure_date",
-            ]
-        )
-
-    parse_dates(
-        expenditure,
-        ["expenditure_date"],
-    )
-
-    if "fund_disbursed_amount" in expenditure.columns:
-        expenditure["fund_disbursed_amount"] = numeric(
-            expenditure["fund_disbursed_amount"]
-        )
-
-    expenditure["link_key"] = make_link_key(
-        expenditure
-    )
-
-    expenditure = expenditure.dropna(
-        subset=["link_key"]
-    )
-
-    count_column = (
-        "work_id"
-        if "work_id" in expenditure.columns
-        else "link_key"
-    )
-
-    agg_map = {
-        "total_expenditure": (
-            "fund_disbursed_amount",
-            "sum",
-        ),
-        "num_transactions": (
-            count_column,
-            "count",
-        ),
-        "first_expenditure_date": (
-            "expenditure_date",
-            "min",
-        ),
-        "last_expenditure_date": (
-            "expenditure_date",
-            "max",
-        ),
-    }
-
-    if "vendor_name" in expenditure.columns:
-        agg_map["num_vendors"] = (
-            "vendor_name",
-            "nunique",
-        )
-
-    summary = (
-        expenditure
-        .groupby(
-            "link_key",
-            dropna=False,
-        )
-        .agg(**agg_map)
-        .reset_index()
-    )
-
-    if "num_vendors" not in summary.columns:
-        summary["num_vendors"] = 0
-
-    summary["total_expenditure"] = numeric(
-        summary["total_expenditure"]
-    )
-
-    return summary
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == "__main__":
-    print("Loading official MPLADS source datasets...")
-    data = load_data()
+def save_outputs(
+    master: pl.DataFrame,
+    expenditure_summary: pl.DataFrame,
+) -> None:
+    """
+    Save analytical outputs as CSV files.
+    """
 
     PROCESSED_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    print("Building master work table...")
-    master = build_master(data)
-
-    print("Building expenditure summary...")
-    expenditure_summary = build_expenditure_summary(
-        {"expenditure": data.get("expenditure", pd.DataFrame())}
-    )
-
-    master.to_csv(
+    master.write_csv(
         MASTER_PATH,
-        index=False,
-        date_format="%Y-%m-%d",
+        include_bom=False,
+        null_value="",
     )
 
-    expenditure_summary.to_csv(
+    expenditure_summary.write_csv(
         EXPENDITURE_PATH,
-        index=False,
-        date_format="%Y-%m-%d",
+        include_bom=False,
+        null_value="",
     )
 
-    print("\n========================================")
-    print("FEATURE ENGINEERING COMPLETE")
-    print("========================================")
-    print("Pipeline version:", PIPELINE_VERSION)
 
-    snapshot = (
-        master["monitoring_as_of_date"].iloc[0]
-        if len(master)
-        else "N/A"
+# ============================================================
+# PIPELINE SUMMARY
+# ============================================================
+
+def print_pipeline_summary(
+    master: pl.DataFrame,
+    expenditure_summary: pl.DataFrame,
+) -> None:
+    """
+    Print a concise but useful pipeline summary.
+    """
+
+    print(
+        "\n========================================"
     )
-    print("Monitoring as-of:", snapshot)
-    print("Master shape:", master.shape)
+    print(
+        "FEATURE ENGINEERING COMPLETE"
+    )
+    print(
+        "========================================"
+    )
+
+    print(
+        "Pipeline version:",
+        PIPELINE_VERSION,
+    )
+
+    snapshot = "N/A"
+
+    if (
+        "monitoring_as_of_date"
+        in master.columns
+        and master.height > 0
+    ):
+
+        snapshot = (
+            master["monitoring_as_of_date"]
+            .head(1)
+            .item()
+        )
+
+    print(
+        "Monitoring as-of:",
+        snapshot,
+    )
+
+    print(
+        "Master shape:",
+        master.shape,
+    )
+
     print(
         "Expenditure summary shape:",
         expenditure_summary.shape,
     )
-    print(
-        "Completed works:",
-        int(master["is_completed"].sum()),
-    )
-    print(
-        "Open works:",
-        int(master["is_open"].sum()),
-    )
-    print(
-        "Duplicate candidates:",
-        int(master["is_duplicate_candidate"].sum()),
-    )
-    print(
-        "Bad recommendation dates:",
-        int(master["bad_recommendation_date"].sum()),
-    )
-    print(
-        "Bad completion dates:",
-        int(master["bad_completion_date"].sum()),
-    )
-    print(
-        "Data-quality issue rows:",
-        int(
-            master["data_quality_issue_count"].gt(0).sum()
+
+    # --------------------------------------------------------
+    # Work status
+    # --------------------------------------------------------
+
+    if "is_completed" in master.columns:
+
+        completed_count = (
+            master["is_completed"]
+            .sum()
+        )
+
+        print(
+            "Completed works:",
+            int(completed_count),
+        )
+
+    if "is_open" in master.columns:
+
+        open_count = (
+            master["is_open"]
+            .sum()
+        )
+
+        print(
+            "Open works:",
+            int(open_count),
+        )
+
+    # --------------------------------------------------------
+    # Duplicate candidates
+    # --------------------------------------------------------
+
+    if (
+        "is_duplicate_candidate"
+        in master.columns
+    ):
+
+        duplicate_count = (
+            master[
+                "is_duplicate_candidate"
+            ]
+            .sum()
+        )
+
+        print(
+            "Duplicate candidates:",
+            int(duplicate_count),
+        )
+
+    # --------------------------------------------------------
+    # Date-quality indicators
+    # --------------------------------------------------------
+
+    for column, label in (
+        (
+            "bad_recommendation_date",
+            "Bad recommendation dates",
         ),
+        (
+            "bad_completion_date",
+            "Bad completion dates",
+        ),
+    ):
+
+        if column in master.columns:
+
+            count = (
+                master[column]
+                .sum()
+            )
+
+            print(
+                f"{label}:",
+                int(count),
+            )
+
+    # --------------------------------------------------------
+    # Data quality
+    # --------------------------------------------------------
+
+    if (
+        "data_quality_issue_count"
+        in master.columns
+    ):
+
+        issue_rows = (
+            master
+            .filter(
+                pl.col(
+                    "data_quality_issue_count"
+                ).gt(0)
+            )
+            .height
+        )
+
+        print(
+            "Data-quality issue rows:",
+            int(issue_rows),
+        )
+
+    # --------------------------------------------------------
+    # Financial columns
+    # --------------------------------------------------------
+
+    print(
+        "\nFinancial columns:"
     )
 
-    print("\nFinancial columns:")
-    financial_columns = [
+    financial_columns = (
         "sanction_amount",
         "total_expenditure",
         "expenditure_variance_amount",
         "expenditure_variance_pct",
         "utilization_pct",
         "overspend_pct",
-    ]
+    )
+
     for column in financial_columns:
+
         if column in master.columns:
+
             print(
                 f"  {column}: "
-                f"{master[column].dtype}"
+                f"{master.schema[column]}"
             )
 
-    print("\nSaved:")
-    print(MASTER_PATH)
-    print(EXPENDITURE_PATH)
+    # --------------------------------------------------------
+    # Output paths
+    # --------------------------------------------------------
+
+    print(
+        "\nSaved:"
+    )
+
+    print(
+        MASTER_PATH
+    )
+
+    print(
+        EXPENDITURE_PATH
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    """
+    Execute the complete feature-engineering pipeline.
+    """
+
+    print(
+        "Loading official MPLADS source datasets..."
+    )
+
+    data = load_data()
+
+    print(
+        "Building master work table..."
+    )
+
+    master = build_master(
+        data
+    )
+
+    print(
+        "Building expenditure summary..."
+    )
+
+    expenditure_summary = (
+        build_expenditure_summary(
+            {
+                "expenditure":
+                data.get(
+                    "expenditure",
+                    pl.DataFrame(),
+                )
+            }
+        )
+    )
+
+    print(
+        "Saving analytical outputs..."
+    )
+
+    save_outputs(
+        master,
+        expenditure_summary,
+    )
+
+    print_pipeline_summary(
+        master,
+        expenditure_summary,
+    )
+
+
+# ============================================================
+# SCRIPT ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()

@@ -8,3 +8,121 @@ venv/
 data/processed/final_risk_data.csv
 data/processed/master_risk_scored.csv
 data/data/processed/master_risk_scored.csv
+# ============================================================
+# MPLADS AI MONITOR - Git Ignore
+# ============================================================
+
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# -------------------------
+# Environment / secrets
+# -------------------------
+.env
+.env.*
+!.env.example
+
+# -------------------------
+# Jupyter
+# -------------------------
+.ipynb_checkpoints/
+
+# -------------------------
+# IDE / Editors
+# -------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -------------------------
+# OS files
+# -------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+logs/
+
+# -------------------------
+# Temporary files
+# -------------------------
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# -------------------------
+# Python packaging
+# -------------------------
+build/
+dist/
+*.egg-info/
+
+# -------------------------
+# Test / coverage
+# -------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# -------------------------
+# Streamlit
+# -------------------------
+.streamlit/secrets.toml
+
+# -------------------------
+# Local databases
+# -------------------------
+*.db
+*.sqlite
+*.sqlite3
+
+# -------------------------
+# Large generated data
+# -------------------------
+data/raw/
+data/processed/
+
+# -------------------------
+# Generated reports
+# -------------------------
+reports/generated/
+outputs/
+
+# -------------------------
+# ML temporary artifacts
+# -------------------------
+ml/tmp/
+models/tmp/
+
+# -------------------------
+# ZIP archives
+# -------------------------
+*.zip
+
+# -------------------------
+# Secrets / credentials
+# -------------------------
+*.pem
+*.key
+credentials.json
+service-account*.json
